@@ -15,6 +15,9 @@ import os
 import pandas as pd
 import tushare as ts
 from tqdm import tqdm
+import baostock as bs
+
+DATA_FROM = "BAS_STOCK"
 
 warnings.filterwarnings("ignore")
 
@@ -39,13 +42,16 @@ BAN_PATTERNS = (
     "max retries exceeded"
 )
 
+
 def _looks_like_ip_ban(exc: Exception) -> bool:
     msg = (str(exc) or "").lower()
     return any(pat in msg for pat in BAN_PATTERNS)
 
+
 class RateLimitError(RuntimeError):
     """表示命中限流/封禁，需要长时间冷却后重试。"""
     pass
+
 
 def _cool_sleep(base_seconds: int) -> None:
     jitter = random.uniform(0.9, 1.2)
@@ -53,14 +59,16 @@ def _cool_sleep(base_seconds: int) -> None:
     logger.warning("疑似被限流/封禁，进入冷却期 %d 秒...", sleep_s)
     time.sleep(sleep_s)
 
+
 # --------------------------- 历史K线（Tushare 日线，固定qfq） --------------------------- #
 pro: Optional[ts.pro_api] = None  # 模块级会话
+
 
 def set_api(session) -> None:
     """由外部(比如GUI)注入已创建好的 ts.pro_api() 会话"""
     global pro
     pro = session
-    
+
 
 def _to_ts_code(code: str) -> str:
     """把6位code映射到标准 ts_code 后缀。"""
@@ -71,6 +79,75 @@ def _to_ts_code(code: str) -> str:
         return f"{code}.BJ"
     else:
         return f"{code}.SZ"
+
+
+def _get_kline_baostock(code: str, start: str, end: str) -> pd.DataFrame:
+    """
+    使用Baostock获取股票K线数据
+
+    :param code: 股票代码，如 "600000" 或 "000001"
+    :param start: 开始日期，格式 "YYYYMMDD"
+    :param end: 结束日期，格式 "YYYYMMDD"
+    :return: DataFrame 包含 date, open, close, high, low, volume 字段
+    """
+    # 转换日期格式（从YYYYMMDD转换为YYYY-MM-DD）
+    start_date = f"{start[:4]}-{start[1:6]}-{start[6:8]}"
+    end_date = f"{end[:4]}-{end[4:6]}-{end[6:8]}"
+
+    # 添加市场前缀[1,3](@ref)
+    if code.startswith('6'):
+        full_code = f"sh.{code}"
+    else:
+        full_code = f"sz.{code}"
+
+    try:
+        if lg.error_code != '0':
+            print(f"登录失败: {lg.error_code} - {lg.error_msg}")
+            return pd.DataFrame()
+
+        # 查询历史K线数据[3,5](@ref)
+        # 使用前复权（adjustflag="2"）以匹配tushare的adj="qfq"[1,6](@ref)
+        rs = bs.query_history_k_data_plus(
+            code=full_code,
+            fields="date,code,open,high,low,close,preclose,volume,amount,adjustflag,turn,tradestatus,pctChg,isST,peTTM,psTTM,pcfNcfTTM,pbMRQ",
+            start_date=start_date,
+            end_date=end_date,
+            frequency="d",  # 日线数据
+            adjustflag="2"  # 前复权，对应tushare的qfq
+        )
+
+        if rs.error_code != '0':
+            print(f"查询数据失败: {rs.error_code} - {rs.error_msg}")
+            return pd.DataFrame()
+
+        # 处理返回数据[1,3](@ref)
+        if rs.error_code != '0' or len(rs.data) < 0:
+            print("未获取到数据")
+            return pd.DataFrame()
+
+        df = pd.DataFrame(rs.data, columns=rs.fields)
+
+        # 数据清洗和格式转换，保持与tushare函数相同的格式
+        if df.empty:
+            return pd.DataFrame()
+
+        # 转换数据类型[3](@ref)
+        df['date'] = pd.to_datetime(df['date'])
+        for col in ["open", "high", "low", "close", "preclose", "volume", "amount", "adjustflag", "turn", "tradestatus",
+                    "pctChg", "isST", "peTTM", "psTTM", "pcfNcfTTM", "pbMRQ"]:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+
+        # 选择并重命名字段以保持一致性
+        # df = df[['date', 'open', 'close', 'high', 'low', 'volume']].copy()
+
+        # 按日期排序并重置索引
+        df = df.sort_values('date').reset_index(drop=True)
+
+        return df
+
+    except Exception as e:
+        print(f"获取股票 {code} 数据失败: {e}")
+
 
 def _get_kline_tushare(code: str, start: str, end: str) -> pd.DataFrame:
     ts_code = _to_ts_code(code)
@@ -99,6 +176,7 @@ def _get_kline_tushare(code: str, start: str, end: str) -> pd.DataFrame:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     return df.sort_values("date").reset_index(drop=True)
 
+
 def validate(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return df
@@ -108,6 +186,7 @@ def validate(df: pd.DataFrame) -> pd.DataFrame:
     if (df["date"] > pd.Timestamp.today()).any():
         raise ValueError("数据包含未来日期，可能抓取错误！")
     return df
+
 
 # --------------------------- 读取 stocklist.csv & 过滤板块 --------------------------- #
 
@@ -131,8 +210,9 @@ def _filter_by_boards_stocklist(df: pd.DataFrame, exclude_boards: set[str]) -> p
 
     return df[mask].copy()
 
+
 def load_codes_from_stocklist(stocklist_csv: Path, exclude_boards: set[str]) -> List[str]:
-    df = pd.read_csv(stocklist_csv)    
+    df = pd.read_csv(stocklist_csv)
     df = _filter_by_boards_stocklist(df, exclude_boards)
     codes = df["symbol"].astype(str).str.zfill(6).tolist()
     codes = list(dict.fromkeys(codes))  # 去重保持顺序
@@ -140,21 +220,33 @@ def load_codes_from_stocklist(stocklist_csv: Path, exclude_boards: set[str]) -> 
                 stocklist_csv, len(codes), ",".join(sorted(exclude_boards)) or "无")
     return codes
 
+
 # --------------------------- 单只抓取（全量覆盖保存） --------------------------- #
 def fetch_one(
-    code: str,
-    start: str,
-    end: str,
-    out_dir: Path,
+        code: str,
+        start: str,
+        end: str,
+        out_dir: Path,
 ):
     csv_path = out_dir / f"{code}.csv"
 
     for attempt in range(1, 4):
         try:
-            new_df = _get_kline_tushare(code, start, end)
-            if new_df.empty:
-                logger.debug("%s 无数据，生成空表。", code)
-                new_df = pd.DataFrame(columns=["date", "open", "close", "high", "low", "volume"])
+            global new_df
+            if DATA_FROM == "BAS_STOCK":
+                new_df = _get_kline_baostock(code, start, end)
+                if new_df.empty:
+                    logger.debug("%s 无数据，生成空表。", code)
+                    new_df = pd.DataFrame(
+                        columns=["date", "code", "open", "high", "low", "close", "preclose", "volume", "amount",
+                                 "adjustflag", "turn", "tradestatus", "pctChg", "isST", "peTTM", "psTTM", "pcfNcfTTM",
+                                 "pbMRQ"])
+            elif DATA_FROM == "TUSHARE":
+                new_df = _get_kline_tushare(code, start, end)
+                if new_df.empty:
+                    logger.debug("%s 无数据，生成空表。", code)
+                    new_df = pd.DataFrame(columns=["date", "open", "close", "high", "low", "volume"])
+
             new_df = validate(new_df)
             new_df.to_csv(csv_path, index=False)  # 直接覆盖保存
             break
@@ -169,14 +261,17 @@ def fetch_one(
     else:
         logger.error("%s 三次抓取均失败，已跳过！", code)
 
+
 # --------------------------- 主入口 --------------------------- #
 def main():
-    parser = argparse.ArgumentParser(description="从 stocklist.csv 读取股票池并用 Tushare 抓取日线K线（固定qfq，全量覆盖）")
+    parser = argparse.ArgumentParser(
+        description="从 stocklist.csv 读取股票池并用 Tushare 抓取日线K线（固定qfq，全量覆盖）")
     # 抓取范围
     parser.add_argument("--start", default="20190101", help="起始日期 YYYYMMDD 或 'today'")
     parser.add_argument("--end", default="today", help="结束日期 YYYYMMDD 或 'today'")
     # 股票清单与板块过滤
-    parser.add_argument("--stocklist", type=Path, default=Path("./stocklist.csv"), help="股票清单CSV路径（需含 ts_code 或 symbol）")
+    parser.add_argument("--stocklist", type=Path, default=Path("./stocklist.csv"),
+                        help="股票清单CSV路径（需含 ts_code 或 symbol）")
     parser.add_argument(
         "--exclude-boards",
         nargs="*",
@@ -190,14 +285,16 @@ def main():
     args = parser.parse_args()
 
     # ---------- Tushare Token ---------- #
-    os.environ["NO_PROXY"] = "api.waditu.com,.waditu.com,waditu.com"
-    os.environ["no_proxy"] = os.environ["NO_PROXY"]
-    ts_token = os.environ.get("TUSHARE_TOKEN")
-    if not ts_token:
-        raise ValueError("请先设置环境变量 TUSHARE_TOKEN，例如：export TUSHARE_TOKEN=你的token")
-    ts.set_token(ts_token)
-    global pro
-    pro = ts.pro_api()
+    if DATA_FROM == "TUSHARE":
+
+        os.environ["NO_PROXY"] = "api.waditu.com,.waditu.com,waditu.com"
+        os.environ["no_proxy"] = os.environ["NO_PROXY"]
+        ts_token = os.environ.get("TUSHARE_TOKEN")
+        if not ts_token:
+            raise ValueError("请先设置环境变量 TUSHARE_TOKEN，例如：export TUSHARE_TOKEN=你的token")
+        ts.set_token(ts_token)
+        global pro
+        pro = ts.pro_api()
 
     # ---------- 日期解析 ---------- #
     start = dt.date.today().strftime("%Y%m%d") if str(args.start).lower() == "today" else args.start
@@ -236,5 +333,29 @@ def main():
 
     logger.info("全部任务完成，数据已保存至 %s", out_dir.resolve())
 
+
 if __name__ == "__main__":
-    main()
+    try:
+        lg = bs.login()
+        # 显示登陆返回信息
+        print('login respond  error_code:' + lg.error_code)
+        print('login respond  error_msg:' + lg.error_msg)
+        if lg.error_code != '0':
+            bs.logout()
+            sys.exit(0)
+        main()
+        try:
+            bs.logout()
+        except Exception as e:
+            pass
+    except Exception as e:
+        print(e)
+        try:
+            bs.logout()
+        except Exception as e:
+            pass
+    except (KeyboardInterrupt, SystemExit):
+        try:
+            bs.logout()
+        except Exception as e:
+            pass
