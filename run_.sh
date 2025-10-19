@@ -1,0 +1,1 @@
+python fetch_kline.py --start 20250101  --end today  --stocklist ./stocklist.csv --exclude-boards bj --out ./k_line_daily_data --workers 1
